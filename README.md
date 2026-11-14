@@ -1,113 +1,153 @@
 # SPHEREx Sky Viewer
 
-A full-stack web app that turns a position on the sky into **real SPHEREx images**, shown in the order they were observed.
+A web application for searching, retrieving and visualising real SPHEREx spectral images from NASA/IPAC's Infrared Science Archive (IRSA).
 
-You enter a Right Ascension, Declination and search radius. The app searches NASA/IPAC IRSA for SPHEREx spectral images, downloads the FITS files you select, renders previews from the real `IMAGE` extension with Astropy, and lets you page through the observations like a flipbook.
-
-> Data source: [NASA/IPAC Infrared Science Archive (IRSA)](https://irsa.ipac.caltech.edu), via the IVOA Simple Image Access v2 (SIA2) service.
-> The app never uses sample, simulated or hardcoded observations. If IRSA fails or returns nothing, you see an error or an empty-result message.
+Built with Next.js, FastAPI and Astropy.
 
 ---
 
-## The problem
+## Contents
 
-SPHEREx data is awkward to explore directly:
-
-- Images are listed through IRSA's SIA2 service, which returns a table of file URLs.
-- Each image is a multi-extension FITS file (roughly 70 MB in early tests).
-- One pointing can come with several detector files.
-- Watching a region change over time means opening many files by hand.
-
-## The idea
-
-Give the app a sky position. It finds the observations, fetches only the files you pick, and shows them in time order.
-
-| Step | What happens |
-|------|--------------|
-| Search by position | RA, Dec and a radius find every overlapping observation. |
-| Retrieve on demand | Metadata loads first. Heavy FITS files download only when selected. |
-| Watch it change | Pointings are sorted by observation time and played like a flipbook. |
+1. [Overview](#overview)
+2. [Problem Statement](#problem-statement)
+3. [Solution](#solution)
+4. [Key Features](#key-features)
+5. [Architecture](#architecture)
+6. [Implementation Details](#implementation-details)
+7. [Getting Started](#getting-started)
+8. [Configuration](#configuration)
+9. [API Reference](#api-reference)
+10. [Testing](#testing)
+11. [Project Status](#project-status)
+12. [Repository Structure](#repository-structure)
+13. [Data Source and References](#data-source-and-references)
 
 ---
 
-## Features
+## Overview
 
-- **Search panel** with validated RA (0–360°), Dec (−90 to +90°), radius in arcsec / arcmin / deg, and a collection selector. An example target (WISE 0855) is prefilled.
-- **Collections:** `spherex_dr1`, `spherex_dr1_deep`, `spherex_qr3`, `spherex_qr3_deep`.
-- **Observation list** grouped by pointing and sorted chronologically, with per-detector files and live status badges.
-- **Scientific image viewer:** zoom, pan, fit/reset, fullscreen, download the current preview, and click for the pixel value and RA/Dec (only when the file's header has a celestial WCS).
-- **Extension inspector:** every FITS extension with its type, shape, data type and header. 2-D image extensions (for example `FLAGS`, `VARIANCE`) can be viewed.
-- **Chronological flipbook:** play, pause, previous, next, timeline slider and 0.5x / 1x / 2x / 4x speed. Only frames with a real, processed preview are played.
-- **Download manager:** reopen, download or delete stored FITS files.
-- **Data guide** page explaining RA/Dec, FITS, FLAGS, VARIANCE and MJy/sr.
+SPHEREx is a NASA infrared space telescope that observes the sky in many narrow wavelength bands. Its spectral images are distributed by IRSA as multi-extension FITS files.
 
----
+SPHEREx Sky Viewer provides a single interface for the full workflow: query the archive by sky position, select observations, retrieve the original FITS files, inspect their contents and view them as images or as a time-ordered sequence.
 
-## How it works
+The application uses real archive data only. No sample or simulated data is used anywhere in the application code. If IRSA is unreachable or returns no matches, the interface reports that directly. Synthetic fixtures exist solely inside the automated tests.
+
+## Problem Statement
+
+Working with SPHEREx data through the archive involves several manual steps:
+
+- **Archive queries.** Observations are found through IRSA's SIA2 service using a sky position, a search radius and a collection. Collections are separated by data release and by survey type.
+- **File-level results.** Search results are a list of files rather than observations. A single telescope pointing is split across several detector files, which makes the raw list difficult to interpret.
+- **Large files.** Each FITS file is large (the application assumes roughly 70 MB per file when prompting for downloads), so retrieval should be selective.
+- **Non-browser format.** FITS cannot be displayed in a browser. Viewing an image requires opening the file, selecting the correct extension, handling invalid pixels and applying an intensity stretch.
+- **Temporal comparison.** Reviewing how a region changes between observations requires sorting files by time and stepping through them manually.
+
+These steps are routine for an experienced user with a Python environment, but they create a significant barrier for quick exploration.
+
+## Solution
+
+The application places a FastAPI backend between the browser and IRSA. The backend handles discovery, download, validation and rendering, and exposes a small REST API to a Next.js frontend.
+
+1. The user enters a position (RA/Dec), a radius and a collection.
+2. The backend queries IRSA and groups detector files into pointings.
+3. The user chooses which files to retrieve. Nothing is downloaded during a search.
+4. The backend downloads each file, validates it with Astropy and renders a PNG preview.
+5. The user inspects extensions and headers, probes pixel values and sky coordinates, or plays pointings back chronologically.
+
+## Key Features
+
+- **Cone search** against IRSA SIA2 for four collections: `spherex_dr1`, `spherex_dr1_deep`, `spherex_qr3` and `spherex_qr3_deep`.
+- **Pointing grouping.** Detector files from the same exposure are presented together, with detector selection inside each pointing.
+- **On-demand retrieval.** Single or batch downloads (up to 25 files) run as background jobs with live status and progress.
+- **Scientific image viewer.** Zoom, pan, fullscreen, FITS extension switching and preview export.
+- **Pixel probe.** Full-resolution pixel position, value and units on click, with RA/Dec when the file header contains a celestial WCS.
+- **Extension inspector.** Type, shape and data type for every HDU, plus a header viewer.
+- **Chronological flipbook.** Playback, stepping, scrubbing and speed control for a selected detector, using only frames with a rendered preview.
+- **Download manager.** List, reopen, re-download and delete files stored on the server.
+- **Data guide.** In-app reference for RA/Dec, FITS extensions, units and detectors.
+- **Service health indicator.** Shows whether the backend and IRSA are reachable.
+
+## Architecture
 
 ```mermaid
 flowchart LR
-  A[Browser<br/>Next.js] -->|REST| B[FastAPI backend]
-  B -->|SIA2 query| C[(NASA/IPAC IRSA)]
-  C -->|VOTable with access_url| B
-  B -->|stream FITS| C
-  B --> D[Astropy: inspect HDUs,<br/>render IMAGE preview]
-  D --> E[(data/fits, data/previews,<br/>SQLite index)]
-  B -->|JSON + PNG preview| A
+    B["Browser<br/>Next.js, React, Tailwind CSS"] -->|REST / JSON| A["FastAPI backend"]
+    A -->|"SIA2 cone search (VOTable)"| I[("IRSA")]
+    A -->|"Allow-listed HTTPS download"| I
+    A --> D[("SQLite index")]
+    A --> F["data/fits<br/>original FITS files"]
+    A --> P["data/previews<br/>PNG and JSON"]
+    F -->|Astropy| P
 ```
 
-1. **Search.** The frontend sends RA, Dec, radius and collection to the backend. The backend builds an SIA2 request (`COLLECTION`, `POS=circle ra dec radius_deg`, `MAXREC`) and parses the returned VOTable with Astropy.
-2. **Discover.** Each row becomes a file record (stored in SQLite). The `access_url` column is the FITS URL.
-3. **Retrieve.** When you select a file, a background job streams the FITS file to disk. The original is kept byte for byte.
-4. **Process.** Astropy opens the file, lists its HDUs and renders a preview of the `IMAGE` extension.
-5. **View.** The frontend polls status, then shows the preview, extension list and flipbook.
+The browser communicates only with the application's own backend. It never contacts IRSA directly and refers to files by opaque identifiers rather than URLs.
 
-### Grouping and chronology
+## Implementation Details
 
-- IRSA file names follow `level2_<planning period>_<exposure>_2D<detector>_...fits`. Files with the same planning period and exposure are treated as detector products of **one pointing**. A file whose name does not match becomes its own group.
-- A pointing's time is the **earliest `t_min`** among its files (MJD). The ISO date shown assumes UTC, and the MJD value is always shown beside it. Pointings with no `t_min` sort last.
-- The flipbook plays **one detector at a time**, so one pointing's detector files are not treated as separate dates.
+### Discovery (`irsa_service.py`)
 
-### Preview rendering
+- Queries `https://irsa.ipac.caltech.edu/SIA` using the `COLLECTION`, `POS=circle <ra> <dec> <radius_deg>` and `MAXREC` parameters. The default VOTable response is parsed with `astropy.io.votable`.
+- All returned columns are retained. Optional columns may be absent.
+- **Grouping.** IRSA file names follow the pattern `level2_<period>_<exposure>_2D<detector>_...fits`. Files with the same period and exposure form one pointing. Names that do not match become individual groups.
+- **Chronological order.** A pointing's time is the earliest `t_min` (MJD) among its files. Dates are displayed assuming UTC, with the MJD shown alongside. Pointings without `t_min` are sorted last.
 
-Previews are for display only: block-averaged to at most 1024 px, clipped to the 1st–99.5th percentile, asinh-stretched, with NaN/inf pixels masked. The scientific values stay in the original FITS file, which you can download unchanged.
+### Retrieval and processing (`download_service.py`)
 
-### Status flow
+- A thread pool (default: 2 workers) executes jobs while the frontend polls for status.
+- Status flow: `discovered`, `queued`, `downloading`, `downloaded`, `processing`, `processed`, or `failed`.
+- Files stream to a temporary `.part` file, are checked against the size limit and the FITS `SIMPLE` signature, then renamed.
+- A file is marked `processed` only after Astropy has opened it and the preview has been rendered.
+- Original files are stored unmodified.
 
-`discovered → queued → downloading → downloaded → processing → processed` (or `failed`).
-A file is marked `processed` only after Astropy opened it and the preview rendered successfully.
+### FITS inspection and rendering (`fits_service.py`)
 
----
+- Files are opened read-only.
+- Only two-dimensional image extensions are previewable.
+- Preview pipeline (for display only): block-average to at most 1024 px on the long side, mask NaN and infinite values, clip to the 1st to 99.5th percentile, then apply an `asinh` stretch. The `FLAGS` extension is rendered as a binary mask.
+- The pixel probe maps a click on the downsampled preview to full-resolution coordinates and reads the value. Sky coordinates are computed through the header WCS when present. Otherwise the response states that no celestial WCS is available.
 
-## Tech stack
+### Persistence (`db.py`)
 
-| Layer | Technology |
-|-------|-----------|
-| Frontend | Next.js 14 (App Router), React, JavaScript, Tailwind CSS, Lucide icons |
-| Backend | Python, FastAPI, Uvicorn, Requests |
-| Science | Astropy (VOTable, FITS, WCS), NumPy, Matplotlib |
-| Storage | Local files plus a SQLite index in `backend/data/` |
+- A SQLite index and the files under `backend/data/` persist across restarts.
+- At startup, jobs interrupted by a restart are marked `failed`.
+- Before reporting a file as available, the backend confirms it still exists on disk. Missing files are reset to `discovered` and can be retrieved again.
 
----
+### Security (`security.py`, `schemas/search.py`)
 
-## Getting started
+- **SSRF protection.** The server fetches only `https` URLs on allow-listed hosts (default: `irsa.ipac.caltech.edu`) without embedded credentials. Redirects are followed manually, up to three hops, and each hop is re-validated.
+- **Input validation.** RA must be within 0 to 360, Dec within -90 to +90, radius positive and no greater than 0.5 degrees, and the collection must be a known value.
+- **Resource limits.** Batch size is capped at 25, download size is capped (default: 600 MB), and concurrent preview rendering is limited by a semaphore.
+- **Untrusted records.** Records whose `access_url` is outside the allow-list remain visible but are flagged, and retrieval is disabled for them.
 
-**Requirements:** Python 3.10+ and Node.js 18.17+ (Next.js 14). Internet access to `irsa.ipac.caltech.edu` is needed for real searches and downloads.
+### Frontend (`frontend/`)
 
-### Linux / macOS
+- Next.js 14 (App Router), React 18, Tailwind CSS and lucide-react.
+- Routes: `/` (Explore), `/downloads` and `/guide`.
+- `services/api.js` is the single client for backend calls and converts FastAPI error payloads into readable messages.
+- The Explore page uses three columns: search and results, viewer and flipbook, and observation details with the extension inspector.
+
+## Getting Started
+
+### Prerequisites
+
+- Python 3 with `venv`
+- Node.js and npm
+- Network access to `irsa.ipac.caltech.edu` for live searches and downloads
+
+### Linux and macOS
 
 ```bash
 # Backend
 cd backend
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8000     # API docs: http://localhost:8000/docs
+uvicorn app.main:app --reload --port 8000    # API docs: http://localhost:8000/docs
 
-# Frontend (second terminal)
+# Frontend (separate terminal)
 cd frontend
-cp ../.env.example .env.local
+cp ../.env.example .env.local                # keep only NEXT_PUBLIC_API_URL
 npm install
-npm run dev                                    # http://localhost:3000
+npm run dev                                  # http://localhost:3000
 ```
 
 ### Windows (PowerShell)
@@ -120,129 +160,121 @@ py -m venv .venv
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 
-# Frontend (second terminal)
+# Frontend (separate terminal)
 cd frontend
 copy ..\.env.example .env.local
 npm install
 npm run dev
 ```
 
-Open <http://localhost:3000>, keep the example target, and press **Search**.
+### Example query
 
-### Configuration
+The search form is pre-filled with RA `133.795129`, Dec `-7.245147`, a 30 arcsec radius and the `spherex_qr3` collection. Submit the search, select a result, then choose **Retrieve FITS** in the details panel.
 
-Frontend (`frontend/.env.local`):
+## Configuration
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `NEXT_PUBLIC_API_URL` | `http://localhost:8000` | Backend base URL |
+Backend settings are optional environment variables, defined in `backend/app/config.py`.
 
-Backend (environment variables, all optional):
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `SPX_DATA_DIR` | `backend/data` | Where FITS files, previews and the SQLite index are stored |
+| Variable | Default | Description |
+|---|---|---|
+| `SPX_DATA_DIR` | `backend/data` | Location of the SQLite index, FITS files and previews |
 | `SPX_CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | Allowed browser origins |
-| `SPX_ALLOWED_HOSTS` | `irsa.ipac.caltech.edu` | Hosts the backend may download from |
-| `SPX_MAX_WORKERS` | `2` | Concurrent download/processing jobs |
-| `SPX_MAXREC` | `2000` | Max rows requested from SIA2 |
-| `SPX_MAX_FITS_MB` | `600` | Max size accepted for one FITS download |
-| `SPX_MAX_PREVIEW_PX` | `1024` | Longest side of a preview image |
+| `SPX_MAX_WORKERS` | `2` | Concurrent download and processing jobs |
+| `SPX_MAXREC` | `2000` | Maximum records requested from IRSA per search |
+| `SPX_MAX_FITS_MB` | `600` | Per-file download size limit |
+| `SPX_MAX_PREVIEW_PX` | `1024` | Maximum preview size (long side) |
+| `SPX_ALLOWED_HOSTS` | `irsa.ipac.caltech.edu` | Hosts the server may fetch from |
 
----
+Frontend: set `NEXT_PUBLIC_API_URL` (default `http://localhost:8000`) in `frontend/.env.local`.
 
-## API
+## API Reference
 
-These are this app's own routes, not IRSA's. Interactive docs are at `/docs` when the backend is running.
+This is the application's own API, not IRSA's. Interactive documentation is available at `/docs` while the backend is running.
 
-| Method | Route | Purpose |
-|--------|-------|---------|
-| GET | `/api/health` | Backend health and IRSA reachability |
-| GET | `/api/observations/collections` | Supported collections |
-| POST | `/api/observations/search` | Search IRSA by RA, Dec, radius, collection |
-| GET | `/api/observations/{group_id}` | One pointing and its files |
-| GET | `/api/files/status?ids=` | Status of several files (used for polling) |
-| POST | `/api/files/{file_id}/download` | Start download and processing |
-| POST | `/api/files/download-batch` | Queue up to 25 files |
-| GET | `/api/files/{file_id}/extensions` | FITS extensions and headers |
-| GET | `/api/files/{file_id}/extensions/{ext}/preview` | PNG preview of an image extension |
-| GET | `/api/files/{file_id}/extensions/{ext}/preview-info` | Display range, units, stretch details |
-| GET | `/api/files/{file_id}/pixel?ext=&px=&py=` | Pixel value and RA/Dec at a click |
-| GET | `/api/files/{file_id}/download-file` | Original FITS file |
-| GET | `/api/downloads` | Locally stored files |
-| DELETE | `/api/downloads/{file_id}` | Delete a stored file and its previews |
+| Method | Route | Description |
+|---|---|---|
+| `GET` | `/api/health` | Backend status and IRSA reachability (`?check_irsa=false` to skip the IRSA check) |
+| `GET` | `/api/observations/collections` | Available collections |
+| `POST` | `/api/observations/search` | Search IRSA and return grouped pointings |
+| `GET` | `/api/observations/{group_id}` | A single pointing and its files |
+| `GET` | `/api/files/{file_id}` | A single file record |
+| `GET` | `/api/files/status?ids=` | Status of up to 200 files |
+| `POST` | `/api/files/{file_id}/download` | Queue a download |
+| `POST` | `/api/files/download-batch` | Queue up to 25 downloads |
+| `GET` | `/api/files/{file_id}/extensions` | FITS extensions and headers |
+| `GET` | `/api/files/{file_id}/extensions/{ext}/preview` | PNG preview |
+| `GET` | `/api/files/{file_id}/extensions/{ext}/preview-info` | Stretch, shape and units used for the preview |
+| `GET` | `/api/files/{file_id}/pixel` | Pixel value and sky coordinates at a position |
+| `GET` | `/api/files/{file_id}/download-file` | Original FITS file |
+| `GET` | `/api/downloads` | Files stored on the server |
+| `DELETE` | `/api/downloads/{file_id}` | Delete a stored file and its previews |
 
-File routes use a `file_id` (one per detector file) because a pointing has several files.
+File routes use a `file_id` (one per detector file) because a pointing contains several files.
 
----
-
-## Safety and reliability
-
-- The browser only talks to this backend, never to IRSA directly.
-- The backend downloads only `https` URLs on allow-listed hosts, and re-checks every redirect hop. Users never supply download URLs, only opaque file ids.
-- Downloads stream to a `.part` file, are checked for a FITS header, and have a size limit.
-- Concurrent downloads and rendering are limited. Interrupted jobs are marked `failed` after a restart.
-- A missing local file is detected and reported, not assumed to exist.
-
----
-
-## Project structure
-
-```text
-spherex-sky-viewer/
-├── backend/
-│   ├── app/
-│   │   ├── main.py            # FastAPI app
-│   │   ├── config.py          # settings and constants
-│   │   ├── db.py              # SQLite file index
-│   │   ├── security.py        # URL allow-list, safe streaming
-│   │   ├── api/               # observations, files, downloads, health routes
-│   │   ├── schemas/search.py  # request validation
-│   │   └── services/
-│   │       ├── irsa_service.py      # SIA2 query, VOTable parsing, grouping
-│   │       ├── fits_service.py      # HDU inspection, previews, pixel probe
-│   │       └── download_service.py  # background download + processing
-│   ├── tests/
-│   ├── data/                  # fits/, previews/, index.sqlite3 (git-ignored)
-│   └── requirements.txt
-├── frontend/
-│   ├── app/                   # pages: Explore, My Downloads, Data Guide
-│   ├── components/            # SearchPanel, ScientificImageViewer, FlipbookControls, ...
-│   ├── services/api.js        # all backend calls
-│   └── package.json
-├── .env.example
-└── README.md
-```
-
----
-
-## Tests
+## Testing
 
 ```bash
 cd backend
-python -m pytest -q                 # offline tests
-SPX_LIVE=1 python -m pytest -q -s   # also runs live IRSA searches (QR3 and DR1)
+
+# Offline tests
+python -m pytest -q
+
+# Include live IRSA searches (requires network access)
+SPX_LIVE=1 python -m pytest -q -s
 ```
 
-Offline tests cover input validation, the URL allow-list, VOTable parsing, grouping and sorting, FITS inspection and preview, a missing `IMAGE` extension and a corrupt file. They use small synthetic fixtures that exist only inside `backend/tests/`; the app itself never uses synthetic data.
+The offline suite covers search input validation, the SSRF allow-list, VOTable parsing, grouping and chronological sorting, FITS inspection and preview rendering, pixel probing without a WCS, handling of missing `IMAGE` extensions and corrupt files, and health and unknown-ID responses. The live tests query `spherex_qr3` and `spherex_dr1`.
 
----
+## Project Status
 
-## Known limitations
+Current version: `0.1.0`.
 
-- Live behavior against IRSA (real results, ~70 MB downloads, real extension layout and WCS) depends on your network. Run the live tests first on a new setup.
-- Pointing grouping relies on IRSA's file-name pattern shown above. If the pattern changes, files fall back to one group each.
-- Observation times are converted from MJD assuming UTC.
-- Pixel RA/Dec appears only when the extension's header contains a celestial WCS. Nothing is invented otherwise.
-- Not included in this version: source detection, comparisons between epochs, cutouts and AI-based analysis.
+**Validated** in a sandbox without network access: backend start-up, health endpoint, input validation, VOTable parsing, grouping and sorting, the SSRF allow-list, FITS inspection, preview and probe, error handling for missing-`IMAGE` and corrupt files, a `502` response when IRSA is unreachable, and a production build of the frontend.
 
----
+**Pending validation** on a networked machine:
 
-## Data and acknowledgements
+- Live IRSA search results
+- Retrieval of a full-size SPHEREx FITS file
+- Behaviour against the actual SPHEREx HDU layout and WCS
+- End-to-end operation of the interface in a browser
 
-- SPHEREx data are served by NASA/IPAC IRSA. See the [SPHEREx Data Access guide](https://caltech-ipac.github.io/spherex-archive-documentation/spherex-data-access) for collections and file layout, and the [SIA2 documentation](https://irsa.ipac.caltech.edu/ibe/sia.html) for query parameters.
-- Built with Next.js, FastAPI and Astropy.
+**Known limitations**
 
-## License
+- Grouping depends on IRSA's file naming convention, taken from IRSA's documented example URLs. Files with non-matching names are shown as individual groups.
+- Timestamps are displayed assuming UTC.
+- Previews are display transformations and are not suitable for quantitative analysis. Use the original FITS files for measurements.
+- The application has no authentication and stores downloads on local disk. It is intended for local or trusted deployments.
 
-Add a license of your choice (for example MIT) before publishing.
+## Repository Structure
+
+```
+spherex-sky-viewer/
+├── backend/
+│   ├── app/
+│   │   ├── main.py              # Application entry point, CORS, startup recovery
+│   │   ├── config.py            # Settings and collections
+│   │   ├── security.py          # URL allow-list and redirect-safe streaming
+│   │   ├── db.py                # SQLite index
+│   │   ├── schemas/search.py    # Search request validation
+│   │   ├── api/                 # health, observations, files, downloads
+│   │   └── services/            # irsa_service, download_service, fits_service
+│   ├── tests/
+│   ├── data/                    # fits/ and previews/ (contents git-ignored)
+│   └── requirements.txt
+├── frontend/
+│   ├── app/                     # Explore, downloads and guide pages
+│   ├── components/              # Viewer, search, flipbook and inspector components
+│   └── services/api.js          # Backend client
+├── .env.example
+└── .gitignore
+```
+
+## Data Source and References
+
+All observation data is provided by NASA/IPAC IRSA.
+
+- [SPHEREx data products](https://caltech-ipac.github.io/spherex-archive-documentation/spherex-data-products)
+- [SPHEREx data access](https://caltech-ipac.github.io/spherex-archive-documentation/spherex-data-access)
+- [SPHEREx Explanatory Supplement](https://irsa.ipac.caltech.edu/data/SPHEREx/docs/SPHEREx_Expsupp.pdf)
+
+Built with [FastAPI](https://fastapi.tiangolo.com/), [Astropy](https://www.astropy.org/), [Next.js](https://nextjs.org/) and [Tailwind CSS](https://tailwindcss.com/).
